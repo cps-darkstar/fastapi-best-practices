@@ -303,6 +303,153 @@ These are out of scope for this behavioral-lane document but should not be ignor
 
 ---
 
+## Appendix A: UUID Hygiene Audit
+
+**TOM rows**: R03 (API Surfaces) + R11 (Validation) + R14 (Database)
+
+UUIDs cross every layer — Python types, Pydantic schemas, wire format, database columns, path parameters, and frontend DOM. Inconsistencies between layers cause subtle bugs (comparison failures, rejected requests, broken links). This audit targets the 7 most common mistake patterns.
+
+### Audit 1: Mixed UUID types in schemas
+
+**What to find**: Some schemas using `UUID4`, others using `UUID`, others using bare `str` for the same kind of ID field.
+
+```bash
+# In Beta-turbo repo:
+# Find all UUID type annotations in Pydantic schemas
+rg "UUID4" apps/backend/modules/*/schemas.py --count
+rg "UUID[^4]" apps/backend/modules/*/schemas.py --count
+rg ":\s*str\b" apps/backend/modules/*/schemas.py | grep -i "id"
+```
+
+**Why it matters**: `UUID4` rejects v1, v5, v7 UUIDs. If the database stores non-v4 UUIDs (e.g., from legacy systems, external APIs, or a future migration to v7), `UUID4` annotations silently reject valid data. If some schemas use `str`, those endpoints accept malformed UUIDs that break downstream.
+
+**What correct looks like**: One decision, applied everywhere. Either `UUID4` (if you're certain everything is v4) or `UUID` (version-agnostic). Never `str` for ID fields.
+
+### Audit 2: Path parameters typed as `str` instead of `UUID`
+
+**What to find**: Route handlers accepting UUID-shaped path params as strings, bypassing Pydantic validation.
+
+```bash
+rg "def.*\(.*_id:\s*str" apps/backend/modules/*/api.py
+rg "def.*\(.*_id:\s*str" apps/backend/api/v1/
+```
+
+**Why it matters**: A path parameter typed as `str` accepts `"not-a-uuid"`, `"'; DROP TABLE--"`, or just `"abc"`. It pushes validation to the service layer or database, where the error message is worse and the attack surface is larger.
+
+**What correct looks like**:
+```python
+# Bad — accepts anything
+@router.get("/projects/{project_id}")
+async def get_project(project_id: str): ...
+
+# Good — rejects malformed UUIDs at the edge
+@router.get("/projects/{project_id}")
+async def get_project(project_id: UUID4): ...
+```
+
+### Audit 3: String comparison of UUIDs
+
+**What to find**: Code comparing UUIDs as strings instead of UUID objects.
+
+```bash
+rg "str\(.*id\).*==" apps/backend/
+rg "\.id\b.*==" apps/backend/ | grep -v "__"
+```
+
+**Why it matters**: `str(uuid).upper() != str(uuid).lower()`. If one side is `"550E8400-..."` and the other is `"550e8400-..."`, string equality fails even though they're the same UUID. Python's `uuid.UUID` handles this correctly via `__eq__`, but only if both sides are UUID objects.
+
+**What correct looks like**:
+```python
+# Bad — breaks on casing mismatch
+if str(post["creator_id"]) == str(token_data["user_id"]): ...
+
+# Good — UUID.__eq__ is case-insensitive
+if post["creator_id"] == token_data["user_id"]: ...  # both UUID objects
+```
+
+### Audit 4: UUID generation scattered across codebase
+
+**What to find**: `uuid.uuid4()` called in multiple places rather than a single generation point.
+
+```bash
+rg "uuid4\(\)" apps/backend/ --count
+rg "uuid\.uuid" apps/backend/ --count
+```
+
+**Why it matters**: Multiple generation points mean no single place to switch to UUIDv7, add logging, or enforce a mock in tests. If some code generates UUIDs in Python and some lets Postgres `gen_random_uuid()` do it, you can't trace ID provenance.
+
+**What correct looks like**: Generate in one layer (database default or a shared utility), not both.
+
+### Audit 5: Database column type vs Python type
+
+**What to find**: SQLAlchemy models using `String` for UUID columns instead of the native `UUID` type.
+
+```bash
+rg "Column.*String.*id" apps/backend/modules/*/models.py
+rg "Column.*UUID" apps/backend/modules/*/models.py --count
+rg "Column.*String" apps/backend/modules/*/models.py | grep -i "id"
+```
+
+**Why it matters**: Postgres `uuid` type is 16 bytes, indexed efficiently. `varchar` UUIDs are 36 bytes, compared as strings (case-sensitive!), and can store malformed values. A `varchar` column silently accepts `"not-a-uuid"` — the native type rejects it.
+
+### Audit 6: Inconsistent serialization in responses
+
+**What to find**: Some endpoints returning UUIDs as hyphenated strings, others as unhyphenated, or some serializing via `str()` manually.
+
+```bash
+rg "str\(.*\.id\)" apps/backend/modules/*/api.py
+rg "str\(.*\.id\)" apps/backend/api/v1/
+rg "\.hex\b" apps/backend/ | grep -i "uuid\|id"
+```
+
+**Why it matters**: If endpoint A returns `"550e8400-e29b-41d4-a716-446655440000"` and endpoint B returns `"550e8400e29b41d4a716446655440000"` (no hyphens), frontend code that passes IDs between views will break. Pydantic's default serializer hyphenates and lowercases — but manual `str()` or `.hex` calls bypass it.
+
+### Audit 7: UUIDs in HTML/templates
+
+**What to find**: If Beta-turbo serves any HTML (admin panels, Jinja2 templates), check for UUIDs used as element IDs.
+
+```bash
+rg 'id=".*\{' templates/ apps/backend/templates/
+rg "id=.*_id" templates/ apps/backend/templates/
+```
+
+**Why it matters**: HTML `id` attributes starting with a digit are invalid per the spec. UUID `550e8400...` starts with `5` — CSS selectors like `#550e8400...` fail, `document.getElementById()` may behave inconsistently across browsers. Use `data-id` attributes instead.
+
+### Summary of expected findings
+
+| Audit | Severity | Likely in Beta-turbo? |
+|-------|----------|----------------------|
+| Mixed UUID types in schemas | High | Very likely across 58 modules |
+| Path params as `str` | High | Likely in older modules |
+| String comparison | Medium | Common in service layer |
+| Scattered generation | Medium | Likely (Python + Postgres) |
+| DB column type mismatch | High | Check earliest models first |
+| Inconsistent serialization | Medium | Likely if any manual `str()` |
+| UUIDs in HTML IDs | Low | Only if serving templates |
+
+### Recommended fix pattern
+
+If the audit finds significant inconsistency, consider a shared UUID type:
+
+```python
+# apps/backend/shared/types.py
+from uuid import UUID
+from pydantic import field_serializer
+
+class ResourceId(UUID):
+    """Standard UUID type for all resource identifiers.
+    Version-agnostic. Always serializes lowercase hyphenated."""
+
+    @field_serializer("*")
+    @classmethod
+    def serialize(cls, v: UUID) -> str:
+        return str(v)  # Pydantic default: lowercase, hyphenated
+```
+
+This gives you one place to change if you move to UUIDv7, add validation, or alter serialization.
+
+---
+
 ## Verification Checklist
 
 Once changes are applied to Beta-turbo:
